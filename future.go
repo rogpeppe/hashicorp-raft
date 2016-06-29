@@ -7,13 +7,27 @@ import (
 
 // Future is used to represent an action that may occur in the future.
 type Future interface {
+	// Error blocks until the future arrives and then
+	// returns the error status of the future.
+	// This may be called any number of times - all
+	// calls will return the same value.
+	// Note that it is not OK to call this method
+	// twice concurrently on the same Future instance.
 	Error() error
 }
 
 // ApplyFuture is used for Apply() and can returns the FSM response.
 type ApplyFuture interface {
 	Future
+
+	// Response returns the FSM response as returned
+	// by the FSM.Apply method. This must not be called
+	// until after the Error method has returned.
 	Response() interface{}
+
+	// Index holds the index of the newly applied log entry.
+	// This must not be called
+	// until after the Error method has returned.
 	Index() uint64
 }
 
@@ -34,6 +48,16 @@ func (e errorFuture) Index() uint64 {
 	return 0
 }
 
+// noError is a sentinel that enables us maintain
+// the invariant that deferError.err is non-nil if
+// and only if the error has been received from
+// the future.
+type noError struct{}
+
+func (noError) Error() string {
+	return ""
+}
+
 // deferError can be embedded to allow a future
 // to provide an error in the future.
 type deferError struct {
@@ -47,13 +71,15 @@ func (d *deferError) init() {
 }
 
 func (d *deferError) Error() error {
-	if d.err != nil {
-		return d.err
+	if d.err == nil {
+		if d.errCh == nil {
+			panic("waiting for response on nil channel")
+		}
+		d.err = <-d.errCh
 	}
-	if d.errCh == nil {
-		panic("waiting for response on nil channel")
+	if d.err == (noError{}) {
+		return nil
 	}
-	d.err = <-d.errCh
 	return d.err
 }
 
@@ -63,6 +89,9 @@ func (d *deferError) respond(err error) {
 	}
 	if d.responded {
 		return
+	}
+	if err == nil {
+		err = noError{}
 	}
 	d.errCh <- err
 	close(d.errCh)
@@ -100,9 +129,7 @@ func (s *shutdownFuture) Error() error {
 	if s.raft == nil {
 		return nil
 	}
-	for s.raft.getRoutines() > 0 {
-		time.Sleep(5 * time.Millisecond)
-	}
+	s.raft.waitShutdown()
 	if closeable, ok := s.raft.trans.(WithClose); ok {
 		closeable.Close()
 	}
